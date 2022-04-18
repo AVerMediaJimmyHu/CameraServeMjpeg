@@ -21,6 +21,6 @@ public class BootupReceiver extends BroadcastReceiver {
         Context ctx = AndroidApplication.getInstance().getApplicationContext();
         SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(ctx);
 
-        return preferences.getBoolean("run_on_boot", true);
+        return preferences.getBoolean("run_on_boot", false);
     }
 }

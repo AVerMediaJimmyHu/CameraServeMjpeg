@@ -13,10 +13,10 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
+        android:name="com.arkconcepts.cameraserve.AndroidApplication"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:name="com.arkconcepts.cameraserve.AndroidApplication"
         android:supportsRtl="false"
         android:theme="@style/AppTheme">
         <activity
@@ -24,25 +24,33 @@
             android:label="@string/app_name"
             android:screenOrientation="landscape"
             android:theme="@style/AppTheme.NoActionBar">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
 
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
         </activity>
         <activity
             android:name="com.arkconcepts.cameraserve.SettingsActivity"
             android:label="@string/title_activity_settings"
             android:screenOrientation="landscape" />
 
+        <activity
+            android:name="com.avermedia.samples.cameraserve.MainActivityKt"
+            android:screenOrientation="userLandscape"
+            android:theme="@style/AppTheme.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <receiver
             android:name="com.arkconcepts.cameraserve.BootupReceiver"
-            android:enabled="true"
+            android:enabled="false"
             android:exported="true"
             android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>
