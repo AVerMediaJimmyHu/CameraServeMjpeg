@@ -1,33 +1,67 @@
 package com.avermedia.samples.cameraserve
 
-import android.graphics.Rect
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
-import android.graphics.YuvImage
-import android.hardware.Camera
-import android.hardware.Camera.PreviewCallback
+import android.hardware.camera2.CameraAccessException
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
+import android.media.ImageReader
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Log
+import android.util.Size
 import android.view.Surface
 import android.view.TextureView
-import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
 import com.arkconcepts.cameraserve.R
-import java.io.ByteArrayOutputStream
-import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.system.exitProcess
 
-class MainActivityKt : AppCompatActivity(), PreviewCallback,
-    MjpegServerKt.OnJpegFrame, TextureView.SurfaceTextureListener {
-    private var camera: Camera? = null
-    private var cameraId: Int = 0
+class MainActivityKt : AppCompatActivity(), TextureView.SurfaceTextureListener,
+    MjpegServerKt.OnJpegFrame {
+
+    companion object {
+        private const val TAG = "MainUi"
+    }
+
     private var previewRunning: Boolean = false
-    private var surface: SurfaceTexture? = null
+    private var surfaceTexture: SurfaceTexture? = null
+    private var previewSize = Size(640, 480)
+
+    private val cameraManager: CameraManager by lazy {
+        getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    }
+
+    /**
+     * A reference to the current [android.hardware.camera2.CameraCaptureSession] for
+     * preview.
+     */
+    private var captureSession: CameraCaptureSession? = null
+
+    /**
+     * An additional thread for running tasks that shouldn't block the UI.
+     */
+    private var backgroundThread: HandlerThread? = null
+
+    /**
+     * A [Handler] for running tasks in the background.
+     */
+    private var backgroundHandler: Handler? = null
 
     private lateinit var mjpegServer: MjpegServerKt
     private lateinit var serverThread: Thread
     private val frameLock = ReentrantReadWriteLock()
-    private val previewStream = ByteArrayOutputStream()
     private var jpegFrame: ByteArray = ByteArray(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,8 +76,14 @@ class MainActivityKt : AppCompatActivity(), PreviewCallback,
 
     override fun onResume() {
         super.onResume()
-        openCamAndPreview()
+        startBackgroundThread()
+        // openCamAndPreview() // onResume
         if (!serverThread.isAlive) serverThread.start()
+    }
+
+    override fun onPause() {
+        stopBackgroundThread()
+        super.onPause()
     }
 
     override fun onBackPressed() {
@@ -53,96 +93,197 @@ class MainActivityKt : AppCompatActivity(), PreviewCallback,
     }
 
     private fun prepareUi() {
-        findViewById<View>(R.id.flipButton)?.setOnClickListener {
-            toggleCamera()
-            openCamAndPreview()
-        }
+//        findViewById<View>(R.id.flipButton)?.setOnClickListener {
+//            toggleCamera()
+//            openCamAndPreview() // prepareUi
+//        }
         findViewById<TextureView>(R.id.textureView)?.let { view ->
             view.surfaceTextureListener = this@MainActivityKt
         }
     }
 
-    private fun toggleCamera() {
-        val cams = Camera.getNumberOfCameras()
-        cameraId++
-        if (cameraId > cams - 1) cameraId = 0
-        if (previewRunning) stopPreview()
-        camera?.release()
-        camera = null
+    /**
+     * Starts a background thread and its [Handler].
+     */
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("CameraBackground")
+        backgroundThread?.start()
+        backgroundHandler = Handler(backgroundThread!!.looper)
+    }
+
+    /**
+     * Stops the background thread and its [Handler].
+     */
+    private fun stopBackgroundThread() {
+        backgroundThread?.quitSafely()
+        try {
+            backgroundThread?.join()
+            backgroundThread = null
+            backgroundHandler = null
+        } catch (e: InterruptedException) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * A [Semaphore] to prevent the app from exiting before closing the camera.
+     */
+    private val cameraOpenCloseLock = Semaphore(1)
+
+    /**
+     * A reference to the opened [android.hardware.camera2.CameraDevice].
+     */
+    private var cameraDevice: CameraDevice? = null
+    private val cameraStateCallback = object : CameraDevice.StateCallback() {
+        override fun onOpened(device: CameraDevice) {
+            Log.d(TAG, "onOpened: ${device.id}")
+            cameraOpenCloseLock.release()
+            cameraDevice = device
+            startPreview()
+        }
+
+        override fun onDisconnected(device: CameraDevice) {
+            Log.d(TAG, "onDisconnected: ${device.id}")
+            stopPreview() // onDisconnected
+            cameraOpenCloseLock.release()
+            cameraDevice = null
+        }
+
+        override fun onError(device: CameraDevice, error: Int) {
+            Log.d(TAG, "onError: ${device.id} $error")
+            stopPreview() // onError
+            cameraOpenCloseLock.release()
+            cameraDevice = null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCamera() {
+        try {
+            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                throw RuntimeException("Time out waiting to lock camera opening.")
+            }
+            val cameraId = cameraManager.cameraIdList.find { id ->
+                val characteristics = cameraManager.getCameraCharacteristics(id)
+                val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                facing == CameraCharacteristics.LENS_FACING_FRONT
+            }
+            if (cameraId != null) {
+                setupImageReader()
+                cameraManager.openCamera(cameraId, cameraStateCallback, null)
+            } else {
+                throw NullPointerException("no camera found")
+            }
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "Cannot access the camera.")
+        } catch (e: NullPointerException) {
+            // Currently an NPE is thrown when the Camera2API is used but not supported on the
+            // device this code runs.
+            Log.e(TAG, "NullPointerException: ${e.message}")
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera opening.")
+        }
     }
 
     private fun startPreview() {
         if (previewRunning) stopPreview()
-        (getSystemService(WINDOW_SERVICE) as? WindowManager)?.defaultDisplay?.let { display ->
-            camera?.setDisplayOrientation(
-                when (display.rotation) {
-                    Surface.ROTATION_0 -> 90
-                    Surface.ROTATION_270 -> 180
-                    else -> 0
-                }
+
+        try {
+            closeCameraSession()
+
+            cameraDevice?.let { device ->
+                openCameraSession(device)
+            }
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "startPreview: ${e.message}")
+        }
+    }
+
+    private fun openCameraSession(device: CameraDevice) {
+        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+
+        surfaceTexture?.let { texture ->
+            texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+
+            val previewSurface = Surface(texture)
+            builder.addTarget(previewSurface)
+
+            val readerSurface = imageReader.surface
+            builder.addTarget(readerSurface)
+
+            device.createCaptureSession(
+                listOf(previewSurface, readerSurface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        builder.set(
+                            CaptureRequest.CONTROL_MODE,
+                            CameraMetadata.CONTROL_MODE_AUTO
+                        )
+                        session.setRepeatingRequest(
+                            builder.build(),
+                            null,
+                            backgroundHandler
+                        )
+                        captureSession = session
+                        previewRunning = true
+                    }
+
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        captureSession = null
+                    }
+                },
+                backgroundHandler,
             )
         }
-
-        camera?.parameters?.let { params ->
-            params.setPreviewSize(640, 480) // (resWidth, resHeight)
-            camera?.parameters = params
-        }
-        try {
-            surface?.let { camera?.setPreviewTexture(it) }
-            camera?.setPreviewCallback(this)
-        } catch (e: IOException) {
-            e.printStackTrace()
-        }
-        camera?.startPreview()
-
-        previewRunning = true
     }
 
     private fun stopPreview() {
         if (!previewRunning) return
-        camera?.stopPreview()
-        camera?.setPreviewCallback(null)
+
+        try {
+            cameraOpenCloseLock.acquire()
+            closeImageReader() // stopPreview
+            closeCameraSession() // stopPreview
+            cameraDevice?.close()
+            cameraDevice = null
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera closing.", e)
+        } finally {
+            cameraOpenCloseLock.release()
+        }
+
         previewRunning = false
     }
 
-    private fun openCamAndPreview() {
-        try {
-            if (camera == null) camera = Camera.open(cameraId)
-            startPreview()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+    private fun closeCameraSession() {
+        captureSession?.close()
+        captureSession = null
     }
 
-    override fun onPreviewFrame(array: ByteArray?, camera: Camera?) {
-        if (array == null || camera == null) return
+    private lateinit var imageReader: ImageReader
 
-        previewStream.reset()
-        val p = camera.parameters
+    private fun setupImageReader() {
+        imageReader =
+            ImageReader.newInstance(previewSize.width, previewSize.height, ImageFormat.JPEG, 1)
+        imageReader.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage()
+            val buffer = image.planes[0].buffer
+//            val data = ByteArray(buffer.remaining())
+//            buffer.get(data)
+            updateJpegFrame(buffer)
+            image.close()
+        }, null)
+    }
 
-        var previewHeight = p.previewSize.height
-        var previewWidth = p.previewSize.width
+    private fun closeImageReader() {
+        imageReader.close()
+    }
 
-//        val bytes = when (rotationSteps) {
-//            1 -> Rotator.rotateYUV420Degree90(array, previewWidth, previewHeight)
-//            2 -> Rotator.rotateYUV420Degree180(array, previewWidth, previewHeight)
-//            3 -> Rotator.rotateYUV420Degree270(array, previewWidth, previewHeight)
-//            else -> array
-//        }
-//
-//        if (rotationSteps == 1 || rotationSteps == 3) {
-//            val tmp = previewHeight
-//            previewHeight = previewWidth
-//            previewWidth = tmp
-//        }
-
-        val format = p.previewFormat
-        YuvImage(array, format, previewWidth, previewHeight, null)
-            .compressToJpeg(Rect(0, 0, previewWidth, previewHeight), 100, previewStream)
-
+    private fun updateJpegFrame(buffer: ByteBuffer) {
         try {
             frameLock.writeLock().lock()
-            jpegFrame = previewStream.toByteArray()
+            jpegFrame = ByteArray(buffer.remaining())
+            buffer.get(jpegFrame)
         } finally {
             frameLock.writeLock().unlock()
         }
@@ -158,21 +299,16 @@ class MainActivityKt : AppCompatActivity(), PreviewCallback,
     }
 
     override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
-        surface = texture
-        camera?.release()
-        camera = null
-        openCamAndPreview()
+        surfaceTexture = texture
+        openCamera() // onSurfaceTextureAvailable
     }
 
     override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
-        surface = texture
-        openCamAndPreview()
+        surfaceTexture = texture
     }
 
     override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-        stopPreview()
-        camera?.release()
-        camera = null
+        stopPreview() // onSurfaceTextureDestroyed
         return true
     }
 
