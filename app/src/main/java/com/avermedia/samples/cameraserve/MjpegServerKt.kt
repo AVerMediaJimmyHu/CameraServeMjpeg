@@ -1,64 +1,90 @@
 package com.avermedia.samples.cameraserve
 
 import android.os.Process
+import android.util.Log
 import java.io.DataOutputStream
 import java.io.IOException
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 
-class MjpegServerKt(
-    private val onJpegFrame: OnJpegFrame,
-    private var port: Int = 8080,
-    private val timeout: Int = 5000,
-) : Runnable {
+class MjpegServerKt(private val runnable: ServerRunnable) : Thread(runnable) {
+    companion object {
+        private const val TAG = "MjpegServer"
+    }
+
     interface OnJpegFrame {
         fun onJpegFrame(): ByteArray
     }
 
-    override fun run() {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+    class ServerRunnable(
+        private val onJpegFrame: OnJpegFrame,
+        private var port: Int = 8080,
+        private val timeout: Int = 5000,
+    ) : Runnable {
+        var running: Boolean = true
+        private val socketRunnable = ArrayList<SocketRunnable>()
 
-        var server: ServerSocket
-        try {
-            server = ServerSocket(port)
-            server.soTimeout = timeout
-        } catch (e: IOException) {
-            e.printStackTrace()
-            return
-        }
+        override fun run() {
+            Log.v(TAG, "ServerSocket RUN")
+            socketRunnable.clear()
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
 
-        while (true) {
+            var server: ServerSocket
             try {
-                val socket = server.accept()
-                if (socket.inetAddress.isSiteLocalAddress) {
-                    val mjpegSocket = MjpegSocketKt(socket, onJpegFrame)
-                    Thread(mjpegSocket).start()
-                } else {
-                    socket.close()
-                }
-            } catch (ste: SocketTimeoutException) {
-                // continue silently
-            } catch (ioe: IOException) {
-                ioe.printStackTrace()
+                server = ServerSocket(port)
+                server.soTimeout = timeout
+            } catch (e: IOException) {
+                Log.e(TAG, "ServerSocket: ${e.message}")
+                return
             }
-            if (port != server.localPort) {
+
+            while (running) {
                 try {
-                    server.close()
-                    server = ServerSocket(port)
-                    server.soTimeout = timeout
-                } catch (e: IOException) {
-                    e.printStackTrace()
+                    val socket = server.accept()
+                    Log.v(TAG, "accept: ${socket.inetAddress.hostAddress}:${socket.port}")
+                    if (socket.inetAddress.isSiteLocalAddress) {
+                        val mjpegSocket = SocketRunnable(socket, onJpegFrame)
+                        Thread(mjpegSocket).start()
+                        socketRunnable.add(mjpegSocket) // add to list
+                    } else {
+                        socket.close()
+                    }
+                } catch (ste: SocketTimeoutException) {
+                    // continue silently
+                } catch (ioe: IOException) {
+                    Log.e(TAG, "IOException: ${ioe.message}")
+                }
+                if (port != server.localPort) { // keep listening
+                    try {
+                        server.close()
+                        server = ServerSocket(port)
+                        server.soTimeout = timeout
+                    } catch (e: IOException) {
+                        Log.e(TAG, "ServerSocket: ${e.message}")
+                    }
                 }
             }
+
+            try {
+                socketRunnable.forEach { runnable -> runnable.running = false } // close socket
+                server.close()
+            } catch (e: IOException) {
+                Log.e(TAG, "IOException: ${e.message}")
+            }
+            Log.v(TAG, "ServerSocket END")
         }
     }
 
-    class MjpegSocketKt(private val socket: Socket, private val onJpegFrame: OnJpegFrame) :
-        Runnable {
+    class SocketRunnable(
+        private val socket: Socket,
+        private val onJpegFrame: OnJpegFrame,
+    ) : Runnable {
         private val boundary = "CameraServeDataBoundary"
+        var running: Boolean = true
 
         override fun run() {
+            Log.v(TAG, "SocketRunnable(${socket.port}) RUN")
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
 
             try {
@@ -75,7 +101,7 @@ class MjpegServerKt(
                         "\n--" + boundary + "\r\n"
                 stream.write(httpHeader.toByteArray())
                 stream.flush()
-                while (true) {
+                while (running) {
                     val frame = onJpegFrame.onJpegFrame()
                     val frameHeader = "Content-type: image/jpeg\r\n" +
                             "Content-Length: " + frame.size + "\r\n\r\n"
@@ -84,8 +110,23 @@ class MjpegServerKt(
                     stream.write("\r\n--$boundary\r\n".toByteArray())
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                Log.e(TAG, "MjpegSocket(${socket.port}): ${e.message}")
             }
+            Log.v(TAG, "SocketRunnable(${socket.port}) END")
         }
     }
+
+    fun resumeServer() {
+        if (!isAlive) {
+            Log.v(TAG, "RESUME")
+            runnable.running = true
+            start()
+        }
+    }
+
+    fun pauseServer() {
+        Log.v(TAG, "PAUSE")
+        runnable.running = false
+    }
 }
+

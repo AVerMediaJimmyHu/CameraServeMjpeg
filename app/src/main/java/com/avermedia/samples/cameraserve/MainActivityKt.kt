@@ -26,7 +26,6 @@ import java.nio.ByteBuffer
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
-import kotlin.system.exitProcess
 
 class MainActivityKt : AppCompatActivity(), TextureView.SurfaceTextureListener,
     MjpegServerKt.OnJpegFrame {
@@ -59,8 +58,7 @@ class MainActivityKt : AppCompatActivity(), TextureView.SurfaceTextureListener,
      */
     private var backgroundHandler: Handler? = null
 
-    private lateinit var mjpegServer: MjpegServerKt
-    private lateinit var serverThread: Thread
+    private lateinit var serverThread: MjpegServerKt
     private val frameLock = ReentrantReadWriteLock()
     private var jpegFrame: ByteArray = ByteArray(0)
 
@@ -69,28 +67,35 @@ class MainActivityKt : AppCompatActivity(), TextureView.SurfaceTextureListener,
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main_kt)
         prepareUi()
+
         // FIXME: check camera permission
-        mjpegServer = MjpegServerKt(this)
-        serverThread = Thread((mjpegServer))
+
+        serverThread = MjpegServerKt(MjpegServerKt.ServerRunnable(this))
     }
 
     override fun onResume() {
         super.onResume()
         startBackgroundThread()
         // openCamAndPreview() // onResume
-        if (!serverThread.isAlive) serverThread.start()
+        serverThread.resumeServer()
     }
 
     override fun onPause() {
+        serverThread.pauseServer()
         stopBackgroundThread()
         super.onPause()
     }
 
-    override fun onBackPressed() {
-        super.onBackPressed()
-        this.finish()
-        exitProcess(0)
+    override fun onDestroy() {
+        stopPreview() // onDestroy
+        super.onDestroy()
     }
+
+//    override fun onBackPressed() {
+//        super.onBackPressed()
+//        this.finish()
+//        exitProcess(0)
+//    }
 
     private fun prepareUi() {
 //        findViewById<View>(R.id.flipButton)?.setOnClickListener {
